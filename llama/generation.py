@@ -112,17 +112,26 @@ class Llama:
         logprobs: bool = False,
         echo: bool = False,
     ) -> Tuple[List[List[int]], Optional[List[List[float]]]]:
+        # 获取模型参数
         params = self.model.params
+        # 获取批处理大小
         bsz = len(prompt_tokens)
+        # 检查批处理大小是否在允许的最大批处理大小范围内
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
+        # 查找提示标记的最小和最大长度
         min_prompt_len = min(len(t) for t in prompt_tokens)
         max_prompt_len = max(len(t) for t in prompt_tokens)
         assert max_prompt_len <= params.max_seq_len
+        
+        # 计算要生成的标记的总长度
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
+        
+        # 创建一个张量来存储生成的标记，填充为填充标记
         tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        # 将提示标记复制到标记张量中
         for k, t in enumerate(prompt_tokens):
             tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
         if logprobs:
@@ -130,8 +139,11 @@ class Llama:
 
         prev_pos = 0
         eos_reached = torch.tensor([False] * bsz, device="cuda")
+        # 创建一个掩码以识别输入文本
         input_text_mask = tokens != pad_id
+        # 逐个生成标记
         for cur_pos in range(min_prompt_len, total_len):
+            # 通过模型进行前向传递以获取logits
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
             if logprobs:
                 token_logprobs[:, prev_pos + 1 : cur_pos + 1] = -F.cross_entropy(
@@ -141,16 +153,20 @@ class Llama:
                     ignore_index=pad_id,
                 )
             if temperature > 0:
+                # 对logits应用温度并计算概率
                 probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
+                # 对logits应用温度并计算概率
                 next_token = sample_top_p(probs, top_p)
             else:
+                # 对logits应用温度并计算概率
                 next_token = torch.argmax(logits[:, -1], dim=-1)
 
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
+            # 只有在已经生成了提示的情况下才替换标记
             next_token = torch.where(
                 input_text_mask[:, cur_pos], tokens[:, cur_pos], next_token
-            )
+            )  # 这段代码的目的是检查input_text_mask在cur_pos位置上的每个值。如果该位置的值为True（或1），则从tokens中选择相应的值作为next_token，否则保持next_token的当前值
             tokens[:, cur_pos] = next_token
             eos_reached |= (~input_text_mask[:, cur_pos]) & (
                 next_token == self.tokenizer.eos_id
@@ -161,15 +177,18 @@ class Llama:
 
         if logprobs:
             token_logprobs = token_logprobs.tolist()
+        # 将生成的标记解码为文本
         out_tokens, out_logprobs = [], []
         for i, toks in enumerate(tokens.tolist()):
             # cut to max gen len
+            # 将生成的标记解码为文本
             start = 0 if echo else len(prompt_tokens[i])
             toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
             probs = None
             if logprobs:
                 probs = token_logprobs[i][start : len(prompt_tokens[i]) + max_gen_len]
             # cut to eos tok if any
+            # 将标记截断到如果存在结束标记
             if self.tokenizer.eos_id in toks:
                 eos_idx = toks.index(self.tokenizer.eos_id)
                 toks = toks[:eos_idx]
@@ -189,6 +208,7 @@ class Llama:
     ) -> List[CompletionPrediction]:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
+        # 使用分词器对提示进行编码为标记
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
         generation_tokens, generation_logprobs = self.generate(
             prompt_tokens=prompt_tokens,
@@ -300,11 +320,18 @@ class Llama:
 
 
 def sample_top_p(probs, p):
+    # 按降序对概率进行排序
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
+    # 计算概率的累积和
     probs_sum = torch.cumsum(probs_sort, dim=-1)
+    # 创建一个掩码以过滤累积概率超过p的标记
     mask = probs_sum - probs_sort > p
+    # 将被过滤的标记的概率设置为 0
     probs_sort[mask] = 0.0
+    # 将被过滤的标记的概率设置为
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    # 使用修改后的概率进行抽样下一个标记
     next_token = torch.multinomial(probs_sort, num_samples=1)
+    # 收集抽样标记的原始索引
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
